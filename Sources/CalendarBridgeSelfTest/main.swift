@@ -3,7 +3,7 @@ import Foundation
 
 private var failures: [String] = []
 
-@MainActor private func check(_ condition: @autoclosure () throws -> Bool, _ name: String) {
+private func check(_ condition: @autoclosure () throws -> Bool, _ name: String) {
   do {
     if try !condition() { failures.append(name) }
   } catch {
