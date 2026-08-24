@@ -53,7 +53,10 @@ zip_path="${dist_dir}/${release_name}.zip"
 checksum_path="${zip_path}.sha256"
 /bin/rm -f "${zip_path}" "${checksum_path}"
 /usr/bin/ditto -c -k --norsrc --keepParent "${stage_dir}" "${zip_path}"
-/usr/bin/shasum -a 256 "${zip_path}" > "${checksum_path}"
+(
+  cd "${dist_dir}"
+  /usr/bin/shasum -a 256 "${release_name}.zip" > "${release_name}.zip.sha256"
+)
 
 echo "Created: ${zip_path}"
 echo "Created: ${checksum_path}"
