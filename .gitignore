@@ -1,0 +1,10 @@
+.build/
+__pycache__/
+*.pyc
+.DS_Store
+.swiftpm/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+CalendarBridge.app/
+CalendarBridgePrivate

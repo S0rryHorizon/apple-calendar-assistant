@@ -1,0 +1,6 @@
+interface:
+  display_name: "Apple 日历助手"
+  short_description: "从文字、课表和文件管理 Apple 日历与待办"
+  default_prompt: "Use $apple-calendar-assistant to add my schedule and reminders to Apple Calendar."
+policy:
+  allow_implicit_invocation: true
