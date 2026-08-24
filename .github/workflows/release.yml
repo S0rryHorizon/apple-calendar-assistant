@@ -23,7 +23,9 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - name: Build package
-        run: ./scripts/package-release.sh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: VERSION="${TAG#v}" ./scripts/package-release.sh
 
       - name: Create GitHub Release
         env:
