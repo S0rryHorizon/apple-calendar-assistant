@@ -4,6 +4,8 @@
 
 这是一个面向 macOS 的个人效率工具，不提供独立日历界面、云服务器或第三方通知服务。
 
+普通使用者请先阅读：[用户手册](docs/USER_GUIDE.md)。
+
 ## 要求与限制
 
 - macOS、Swift 工具链和 Apple EventKit；默认日历与提醒列表必须是 iCloud 容器。
