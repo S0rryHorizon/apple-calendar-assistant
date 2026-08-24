@@ -93,7 +93,7 @@ JSON
 
 ## 从 GitHub Release 安装
 
-GitHub Release 可以携带预编译的 `.zip`、`.dmg` 或其他二进制附件，使用者无需安装 Swift 即可运行。本项目会提供一个明确标注的 Apple Silicon 实验性 Release。下载对应版本的 zip 和 `.sha256` 文件后：
+GitHub Release 可以携带预编译的 `.zip`、`.dmg` 或其他二进制附件，使用者无需安装 Swift 即可运行。本项目的实验性版本发布在 [GitHub Releases](https://github.com/S0rryHorizon/apple-calendar-assistant/releases)。下载对应版本的 zip 和 `.sha256` 文件后：
 
 ```sh
 shasum -a 256 -c CalendarBridge-1.0.0-macos-arm64-unsigned.zip.sha256

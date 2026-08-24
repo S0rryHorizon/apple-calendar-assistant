@@ -25,7 +25,7 @@
 ./scripts/install.sh
 ```
 
-也可以从 GitHub Releases 下载预编译的 Apple Silicon 实验包，按[用户手册](docs/USER_GUIDE.md)中的校验和安装步骤操作。
+也可以从 [GitHub Releases](https://github.com/S0rryHorizon/apple-calendar-assistant/releases) 下载预编译的 Apple Silicon 实验包，按[用户手册](docs/USER_GUIDE.md)中的校验和安装步骤操作。
 
 安装完成后，Bridge 位于 `~/Applications/CalendarBridge.app`，原生提醒事项字段辅助程序位于
 `~/Applications/CalendarBridgePrivate`，Skill 位于 `~/.codex/skills/apple-calendar-assistant`。
