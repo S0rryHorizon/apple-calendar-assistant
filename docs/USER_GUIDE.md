@@ -93,14 +93,23 @@ JSON
 
 ## 从 GitHub Release 安装
 
-GitHub Release 可以携带预编译的 `.zip`、`.dmg` 或其他二进制附件，使用者无需安装 Swift 即可运行。预编译包应同时包含：
+GitHub Release 可以携带预编译的 `.zip`、`.dmg` 或其他二进制附件，使用者无需安装 Swift 即可运行。本项目会提供一个明确标注的 Apple Silicon 实验性 Release。下载对应版本的 zip 和 `.sha256` 文件后：
+
+```sh
+shasum -a 256 -c CalendarBridge-1.0.0-macos-arm64-unsigned.zip.sha256
+unzip CalendarBridge-1.0.0-macos-arm64-unsigned.zip
+cd CalendarBridge-1.0.0-macos-arm64-unsigned
+./install-release.sh
+```
+
+预编译包应同时包含：
 
 - `CalendarBridge.app`；
 - `CalendarBridgePrivate`；
 - `apple-calendar-assistant` Skill；
 - 一个只负责复制文件、设置权限并提示授权的安装脚本。
 
-但当前项目使用私有 ReminderKit 辅助程序，而且开发环境没有 Developer ID 签名证书，因此暂不把未签名的单架构二进制冒充正式安装包。未签名下载包可能触发 Gatekeeper，并且不能给用户提供稳定的跨 macOS 版本保证。
+实验性包只适用于 Apple Silicon 和 macOS 26 或更高版本，并且使用私有 ReminderKit 辅助程序。它没有 Developer ID 签名，可能触发 Gatekeeper；请确认下载来源后在 Finder 中右键选择“打开”。Intel Mac 或更旧 macOS 请使用源码安装，并自行确认 ReminderKit 是否可用。
 
 正式发布二进制时，建议构建 Apple Silicon 与 Intel 通用版本，并使用 Developer ID 签名、Hardened Runtime 和 Apple notarization。否则应把源码安装作为默认路径，并在 Release 说明中明确“实验性、未签名、仅限特定 macOS 版本”。
 
