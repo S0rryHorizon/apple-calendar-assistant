@@ -48,8 +48,21 @@ echo '{"action":"status"}' | ~/Applications/CalendarBridge.app/Contents/MacOS/Ca
 
 ```sh
 swift run CalendarBridgeSelfTest
-python3 -m unittest Tests/parser_test.py
+swift run CalendarBridgeReliabilityTests
+swift run CalendarBridgeServiceTests
+swift run CalendarBridgeServiceTests --demo
+python3 -m venv .venv
+.venv/bin/python -m pip install -r Tests/requirements.txt
+.venv/bin/python -m unittest Tests/parser_test.py Tests/installer_test.py
+python3 -m unittest Tests/notification_smoke_test.py
 ```
+
+`CalendarBridgeServiceTests --demo` 是可直接运行的受控 synthetic 演示：它打印原列表中
+已完成提醒恢复与查询失败时的 `unknown`。完整测试也直接调用
+`EventKitService.handle`，只使用临时 SQLite、操作 journal 和虚构的恢复后端，
+不会访问真实 Calendar、Reminders、TCC 或私人辅助程序。场景覆盖查询歧义、
+删除后的独立核对、原容器恢复、已完成提醒状态和写入后失败。详见
+[可靠性验证与恢复边界](docs/RELIABILITY.md)。
 
 需要验证真实 iCloud 同步和系统通知时，主动运行：
 
@@ -57,7 +70,7 @@ python3 -m unittest Tests/parser_test.py
 ./scripts/notification-smoke-test.sh
 ```
 
-它会请求权限、创建一条约一分钟后提醒的测试事件，并输出对应的清理命令。通知出现后运行清理命令即可按批次撤销，不会触碰其他事项。
+它会请求权限，先预览无冲突、无重复的测试事件，再用同一批次 ID 提交；只有收到明确的 `committed` 回执才提示等待通知和输出清理命令。通知出现后运行清理命令，脚本只在收到同 ID 的 `rolled_back` 回执时报告清理成功。调用失败或结果不确定时保留批次 ID，供人工核查，不自动重试或清理。
 
 接口细节由已安装 Skill 的 `references/interface.md` 维护。本地操作记录存放在 `~/Library/Application Support/CalendarBridge/operations.sqlite`，不会保存原始课表、截图或网页。
 
@@ -66,8 +79,20 @@ python3 -m unittest Tests/parser_test.py
 提醒事项的“提前提醒”不是 EventKit 的普通 alarm。Bridge 对单条提醒使用
 `CalendarBridgePrivate` 写入 iCloud Reminders 的原生 Early Reminder 字段，因此
 iPhone 会同时显示正确的截止日期和“提前提醒”；该辅助程序使用当前 macOS 的
-ReminderKit 私有接口，若系统升级后失效，重新运行安装脚本即可重建。
+ReminderKit 私有接口，若系统升级后失效，可能需要适配私有接口；重新编译不保证恢复。
 
 ## 开源许可
 
 本项目采用 MIT License，详见 `LICENSE`。
+
+## Protocol 2 可靠性边界
+
+写入需要稳定的操作 ID 和匹配的预览；部分修改使用 `event.patch` / `reminder.patch`。
+不确定结果可用 `operation.status` / `operation.reconcile` 核查，同一操作 ID 不会重新执行写入。
+回滚只有在明确找到原事项或可证明其缺席时才继续；旧快照缺少原容器、容器失效、
+事项身份不明或提醒完成状态未知时保留 `unknown`。这不能保证 exactly-once，
+详见[可靠性验证与恢复边界](docs/RELIABILITY.md)。
+
+使用 `scripts/install.sh` 一同安装 Bridge 与 Skill。安装器会暂存并校验文件、
+替换应用和 Skill、在失败时回退，并将哈希记录在私人安装清单中。
+配置保存在 Skill 目录之外；`diagnostics` 无需请求日历权限即可检查安装状态。

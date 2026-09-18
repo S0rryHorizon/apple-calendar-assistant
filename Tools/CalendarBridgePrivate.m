@@ -63,7 +63,20 @@ int main(void) {
         NSDictionary *command = object;
         NSString *action = command[@"action"];
         NSString *reminderID = command[@"id"];
-        if (![action isKindOfClass:[NSString class]] || ![action isEqualToString:@"set_early_reminder"]) {
+        if ([action isEqualToString:@"probe"]) {
+            BOOL available = [REMStore instancesRespondToSelector:@selector(fetchReminderWithObjectID:fetchOptions:error:)]
+              && [REMReminderFetchOptions respondsToSelector:@selector(fetchOptionsIncludingDueDateDeltaAlerts)]
+              && [REMSaveRequest instancesRespondToSelector:@selector(saveSynchronouslyWithError:)]
+              && [REMReminderChangeItem instancesRespondToSelector:@selector(dueDateDeltaAlertContext)]
+              && [NSClassFromString(@"REMReminderDueDateDeltaAlertContext") instancesRespondToSelector:NSSelectorFromString(@"fetchedCurrentDueDateDeltaAlert")]
+              && [NSClassFromString(@"REMDueDateDeltaAlert") instancesRespondToSelector:NSSelectorFromString(@"dueDateDelta")]
+              && [REMReminderDueDateDeltaAlertContextChangeItem instancesRespondToSelector:@selector(removeAllFetchedDueDateDeltaAlerts)]
+              && [REMReminderDueDateDeltaAlertContextChangeItem instancesRespondToSelector:@selector(addDueDateDeltaAlertWithDueDateDelta:)];
+            if (!available) return fail(@"Native Early Reminder API is incompatible; no reminder was changed");
+            printJSON(@{ @"status": @"available", @"protocolVersion": @2 });
+            return 0;
+        }
+        if (![action isKindOfClass:[NSString class]] || (![action isEqualToString:@"set_early_reminder"] && ![action isEqualToString:@"read_early_reminder"])) {
             return fail(@"Only action=set_early_reminder is supported");
         }
         if (![reminderID isKindOfClass:[NSString class]] || reminderID.length == 0) {
@@ -80,6 +93,20 @@ int main(void) {
         id fetchOptions = [REMReminderFetchOptions fetchOptionsIncludingDueDateDeltaAlerts];
         id reminder = [store fetchReminderWithObjectID:objectID fetchOptions:fetchOptions error:&error];
         if (!reminder) return fail(error.localizedDescription ?: @"Reminder not found");
+
+        if ([action isEqualToString:@"read_early_reminder"]) {
+            @try {
+                id context = [reminder valueForKey:@"dueDateDeltaAlertContext"];
+                id alert = [context valueForKey:@"fetchedCurrentDueDateDeltaAlert"];
+                if (!alert) { printJSON(@{ @"status": @"read", @"earlyReminder": [NSNull null] }); return 0; }
+                id delta = [alert valueForKey:@"dueDateDelta"];
+                NSNumber *unit = [delta valueForKey:@"unit"];
+                NSNumber *count = [delta valueForKey:@"count"];
+                if (![unit isKindOfClass:[NSNumber class]] || ![count isKindOfClass:[NSNumber class]]) return fail(@"Cannot read native Early Reminder");
+                printJSON(@{ @"status": @"read", @"earlyReminder": @{ @"unit": unit, @"count": count } });
+                return 0;
+            } @catch (NSException *exception) { return fail(@"Native Early Reminder read API incompatible"); }
+        }
 
         REMSaveRequest *save = [[REMSaveRequest alloc] initWithStore:store];
         REMReminderChangeItem *change = [save updateReminder:reminder];

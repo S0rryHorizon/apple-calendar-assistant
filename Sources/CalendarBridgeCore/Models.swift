@@ -154,6 +154,7 @@ public struct BridgeRequest: Codable, Sendable {
   public var range: DateRange?
   public var batchId: String?
   public var scope: String?
+  public var patch: ItemPatch?
 
   public init(
     action: String,
@@ -262,6 +263,7 @@ public struct BridgeResponse: Codable, Sendable {
 
 public struct ItemSnapshot: Codable, Equatable, Sendable {
   public var summary: ItemSummary
+  public var calendarIdentifier: String?
   public var location: String?
   public var notes: String?
   public var url: String?
@@ -270,6 +272,7 @@ public struct ItemSnapshot: Codable, Equatable, Sendable {
 
   public init(
     summary: ItemSummary,
+    calendarIdentifier: String? = nil,
     location: String? = nil,
     notes: String? = nil,
     url: String? = nil,
@@ -277,10 +280,50 @@ public struct ItemSnapshot: Codable, Equatable, Sendable {
     sourceRef: String? = nil
   ) {
     self.summary = summary
+    self.calendarIdentifier = calendarIdentifier
     self.location = location
     self.notes = notes
     self.url = url
     self.recurrence = recurrence
     self.sourceRef = sourceRef
+  }
+}
+
+/// Explicit clear list avoids conflating omission and deletion.
+public struct ItemPatch: Codable, Sendable {
+  public var title: String?
+  public var start: String?
+  public var end: String?
+  public var due: String?
+  public var allDay: Bool?
+  public var timezone: String?
+  public var location: String?
+  public var notes: String?
+  public var url: String?
+  public var alerts: [AlertSpec]?
+  public var earlyReminder: EarlyReminderSpec?
+  public var recurrence: RecurrenceSpec?
+  public var clear: [String]?
+
+  public func applying(to original: ItemDraft) throws -> ItemDraft {
+    var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as! [String: Any]
+    var changes = try JSONSerialization.jsonObject(with: JSONEncoder().encode(self)) as! [String: Any]
+    changes.removeValue(forKey: "clear")
+    let allowed = Set(["location", "notes", "url", "alerts", "earlyReminder", "recurrence"])
+    for key in clear ?? [] {
+      guard allowed.contains(key), changes[key] == nil else {
+        throw BridgeError.invalidRequest("clear 字段无效或同时赋值：\(key)")
+      }
+      object.removeValue(forKey: key)
+      if key == "alerts" { object[key] = [] as [String] }
+    }
+    for (key, value) in changes { object[key] = value }
+    if let start, end == nil, original.kind == .event,
+       let oldStart = original.start, let oldEnd = original.end {
+      let duration = try CalendarRules.parseDate(oldEnd).timeIntervalSince(CalendarRules.parseDate(oldStart))
+      object["end"] = try CalendarRules.formatDate(CalendarRules.parseDate(start).addingTimeInterval(duration))
+    }
+    return try CalendarRules.validated(JSONDecoder().decode(ItemDraft.self,
+      from: JSONSerialization.data(withJSONObject: object)))
   }
 }

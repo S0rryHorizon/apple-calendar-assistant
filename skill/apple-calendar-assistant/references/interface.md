@@ -1,108 +1,45 @@
-# Bridge interface
+# CalendarBridge protocol 2
 
-The bridge reads one JSON object from stdin and writes one JSON response to stdout.
+One JSON request on stdin, one JSON response on stdout. Errors return `ok:false`; a process exit code alone is not a success receipt.
 
-```text
-~/Applications/CalendarBridge.app/Contents/MacOS/CalendarBridge
-```
+Actions: `diagnostics`, `setup`, `status`, `event.list/create/update/patch/delete`, `reminder.list/create/update/patch/delete/complete`, `batch.preview/commit/rollback`, `operation.status/reconcile`.
 
-## Requests
-
-Supported actions:
-
-- `setup`, `status`
-- `event.list`, `event.create`, `event.update`, `event.delete`
-- `reminder.list`, `reminder.create`, `reminder.update`, `reminder.delete`, `reminder.complete`
-- `batch.preview`, `batch.commit`, `batch.rollback`
-
-Shared request fields are `requestId`, `confirmed`, `dryRun`, `item`, `items`, `selector`, `range`, `batchId`, and `scope`. Use `scope: "this"` for one recurring occurrence and `scope: "future"` for that occurrence plus future occurrences.
-
-An event draft:
+## Creates and batches
 
 ```json
-{
-  "kind": "event",
-  "title": "数据库课程",
-  "start": "2026-09-03T09:00:00+08:00",
-  "end": "2026-09-03T10:30:00+08:00",
-  "allDay": false,
-  "timezone": "Asia/Singapore",
-  "location": "Room 201",
-  "notes": "Chapter 3",
-  "alerts": [{"minutesBefore": 60}],
-  "sourceRef": "semester-1.xlsx#row-8"
-}
+{"action":"event.create","dryRun":true,"batchId":"stable-uuid","item":{"kind":"event","title":"Library","start":"2030-09-03T15:00:00+08:00"}}
 ```
 
-A reminder draft uses `due` instead of `start`/`end`. Omit `alerts` for the personal default, provide a complete list to replace it, or use `[]` to remove all alerts. Each alert has exactly one of `at` or `minutesBefore`.
+Retain the returned batch ID. Send the identical request with `dryRun` omitted for creation after the appropriate authorization. Batch work uses `batch.preview` with `items`, then `batch.commit` with the **same input items**, returned `batchId`, and `confirmed:true`. Resolved batch defaults are frozen at preview; do not rebuild them from item summaries. New conflicts or target-container changes require a fresh preview and decision.
 
-For a reminder with one relative alert, the bridge also accepts Apple's native
-Early Reminder field. `unit` is `0` minutes, `1` hours, `2` days, `3` weeks, or
-`4` months; use a negative `count` for an alert before the due date. For
-example, one week before a 5 September deadline is:
+Every write requires a stable `batchId`; legacy requests without it return an upgrade error. Each ID is permanently bound to one write payload. Repeating a completed identical request returns its result, without executing again. `requestId` is optional correlation metadata, not an idempotency key.
+
+Draft fields: `kind`, `title`, `start`, `end`, `due`, `allDay`, `timezone`, `location`, `notes`, `url`, `alerts`, `earlyReminder`, `recurrence`, `sourceRef`. Events need `start`; reminders need `due`. Use ISO 8601 with an offset. `alerts` contains objects with exactly one of `at` or `minutesBefore`; `[]` clears alerts.
+
+Native `earlyReminder` uses `unit` 0/1/2/3/4 for minutes/hours/days/weeks/months and a negative `count` for before, e.g. `{"unit":3,"count":-1}`. It is distinct from generic EventKit alarms. Creation and changes require compatible helper probe and actual readback.
+
+Creation recurrence: `{"frequency":"weekly","interval":1,"daysOfWeek":["MO","WE"],"endDate":"2030-12-01T23:59:59+08:00"}`. Frequencies: daily/weekly/monthly; specify only one of endDate/count. Mutations of recurring or detached existing items are currently rejected because complete series recovery cannot yet be guaranteed; scope=this/future does not bypass this guard.
+
+## Partial updates
 
 ```json
-{
-  "kind": "reminder",
-  "title": "课程项目截止",
-  "due": "2026-09-05T23:59:00+08:00",
-  "earlyReminder": {"unit": 3, "count": -1}
-}
+{"action":"event.patch","dryRun":true,"batchId":"patch-uuid","selector":{"id":"EVENTKIT-ID"},"patch":{"start":"2030-09-03T16:00:00+08:00"}}
 ```
 
-This is separate from EventKit's generic alarm and appears on iPhone as
-“提前提醒”.
+After confirmation, repeat with `confirmed:true` and omit `dryRun`. Omission preserves existing fields. Moving an event's start without supplying an end preserves duration. `clear:["notes","location"]` explicitly clears optional fields. Supported clear names: location, notes, url, alerts, earlyReminder, recurrence. Setting and clearing the same field is invalid.
 
-Recurrence is optional:
+Old `event.update` / `reminder.update` still replace the full item; they now require a matching dry-run preview and batch ID. Prefer patch.
 
-```json
-{"frequency":"weekly","interval":1,"daysOfWeek":["MO","WE"],"endDate":"2026-12-01T23:59:59+08:00"}
-```
+Delete/complete also require `dryRun:true` first, stable `selector.id` and `batchId`, then identical request with `confirmed:true`. A change to the original item invalidates the preview.
 
-Frequency is `daily`, `weekly`, or `monthly`; weekday values are `SU`, `MO`, `TU`, `WE`, `TH`, `FR`, `SA`. Specify only one of `endDate` and `count`.
+## Queries and results
 
-## Examples
+List requests accept `range:{"start":"...","end":"..."}`. Mutations should select stable IDs. Responses include `status`, `batchId`, `items`, `conflicts`, `duplicates`, `details` when applicable. Items contain actual saved location and alerts.
 
-Preview a single creation:
+- `preview` / `needs_confirmation`: no Apple item written.
+- `committed`: durable write receipt; report saved items and batch ID.
+- `rolled_back`: completed recorded rollback.
+- `unknown`: outcome requires inspection, even when some writes may have succeeded.
+- `error`: request/preflight failure; do not claim success.
 
-```json
-{
-  "action": "event.create",
-  "dryRun": true,
-  "item": {
-    "kind": "event",
-    "title": "图书馆",
-    "start": "2026-09-03T15:00:00+08:00"
-  }
-}
-```
-
-Update by stable identifier after confirmation:
-
-```json
-{
-  "action": "event.update",
-  "confirmed": true,
-  "selector": {"id": "EVENTKIT-ID"},
-  "item": {
-    "kind": "event",
-    "title": "图书馆",
-    "start": "2026-09-03T16:00:00+08:00",
-    "alerts": [{"minutesBefore": 30}]
-  }
-}
-```
-
-Batch work is two-phase: send `items` to `batch.preview`, retain its `batchId`, then send the same normalized `items`, `batchId`, and `confirmed: true` to `batch.commit`. Roll back with `{"action":"batch.rollback","batchId":"...","confirmed":true}`.
-
-## Response handling
-
-- `preview`: no conflict or duplicate was found; nothing was written.
-- `needs_confirmation`: show `conflicts` and `duplicates`; nothing was written.
-- `committed`: report `items` and retain `batchId`.
-- `rolled_back`: report restored or removed items.
-- `error`: stop. Do not claim success or silently retry.
-
-`items`, `conflicts`, and `duplicates` include `location` when the Calendar or
-Reminder item has one. This is the location read back from EventKit after a
-write, not just the requested draft value.
+Read [recovery.md](recovery.md) for outcome reconciliation and rollback. A `batch.commit` or `batch.rollback` with dryRun is rejected; use batch.preview for imports.
