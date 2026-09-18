@@ -19,23 +19,97 @@ private final class LockedBox<T>: @unchecked Sendable {
   }
 }
 
-final class EventKitService {
-  private let store = EKEventStore()
+package final class EventKitService: RecoveryBackend {
+  private lazy var store = EKEventStore()
+  private let journal: OperationJournal
   private let audit: AuditStore
+  private let injectedRecovery: (any RecoveryBackend)?
   private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
 
-  init() throws {
+  private var recovery: any RecoveryBackend { injectedRecovery ?? self }
+
+  package init() throws {
+    _ = try BridgeConfiguration.load()
+    journal = try OperationJournal(directory: AuditStore.baseDirectory.appendingPathComponent("journal-v2"))
     audit = try AuditStore()
+    injectedRecovery = nil
     encoder.outputFormatting = [.sortedKeys]
   }
 
-  func handle(_ request: BridgeRequest) throws -> BridgeResponse {
+  package init(journal: OperationJournal, audit: AuditStore, recovery: any RecoveryBackend) {
+    self.journal = journal
+    self.audit = audit
+    injectedRecovery = recovery
+    encoder.outputFormatting = [.sortedKeys]
+  }
+
+  package func handle(_ request: BridgeRequest) throws -> BridgeResponse {
+    if request.dryRun == true && ["batch.commit", "batch.rollback"].contains(request.action) {
+      throw BridgeError.invalidRequest("请使用 batch.preview；回滚须单独确认。")
+    }
+    if request.action == "operation.reconcile" { return try reconcile(request) }
+    if request.action == "operation.status" {
+      guard let id = request.batchId else { throw BridgeError.notFound("没有此操作记录。") }
+      if let rollback = try recordedRollbackResponse(for: id) { return rollback }
+      guard let record = try journal.read("operation:" + id, as: OperationRecord.self) else {
+        throw BridgeError.notFound("没有此操作记录。")
+      }
+      if let data = record.response { return try decoder.decode(BridgeResponse.self, from: data) }
+      return BridgeResponse(ok: false, status: record.state == "executing" ? "unknown" : record.state,
+        message: record.error ?? "操作结果待核查；不要重复写入。", batchId: id,
+        details: ["nextAction": "检查该批次审计记录及 Apple 实际事项；不得重新创建"])
+    }
+    if request.action == "diagnostics" {
+      var response = status(request)
+      response.details?["protocolVersion"] = "2"
+      response.details?["journalVersion"] = "2"
+      response.details?["earlyReminder"] = FileManager.default.isExecutableFile(atPath:
+        ReminderKitPrivateService.defaultExecutable.path) ? "installed; probe required before write" : "missing"
+      return response
+    }
+    let mutations = ["event.create", "event.update", "event.patch", "event.delete",
+      "reminder.create", "reminder.update", "reminder.patch", "reminder.delete", "reminder.complete",
+      "batch.commit", "batch.rollback"]
+    if mutations.contains(request.action), request.dryRun == true, request.action != "batch.rollback" {
+      var previewRequest = request
+      previewRequest.batchId = request.batchId ?? UUID().uuidString.lowercased()
+      let response = try dispatch(previewRequest)
+      var canonical = previewRequest; canonical.requestId = nil; canonical.confirmed = nil; canonical.dryRun = nil
+      let before = try targetSnapshot(previewRequest)
+      try journal.write("single-preview:" + previewRequest.batchId!, SinglePreview(
+        digest: OperationJournal.digest(try OperationJournal.encode(canonical)), before: before,
+        analysis: try previewDigest(response)))
+      var result = response; result.batchId = previewRequest.batchId
+      return result
+    }
+    guard mutations.contains(request.action) else { return try dispatch(request) }
+    return try MutationCoordinator(journal: journal).perform(request, preflight: { id, digest in
+    if !request.action.hasSuffix(".create"), request.confirmed != true {
+      throw BridgeError.confirmationRequired("此操作需要对已展示内容的明确确认。")
+    }
+    if request.action == "batch.commit" { _ = try self.checkedBatch(request) }
+    if request.action != "batch.commit" && request.action != "batch.rollback" {
+      guard let saved = try journal.read("single-preview:" + id, as: SinglePreview.self),
+        saved.digest == digest, try saved.before == targetSnapshot(request) else {
+        throw BridgeError.confirmationRequired("缺少对应预览或原事项已变化；重新预览。")
+      }
+      var check = request; check.dryRun = true
+      guard try previewDigest(dispatch(check)) == saved.analysis else {
+        throw BridgeError.confirmationRequired("预览结果已变化；重新预览。")
+      }
+    }
+    }, execute: { try self.dispatch(request) })
+  }
+
+  private func dispatch(_ request: BridgeRequest) throws -> BridgeResponse {
     switch request.action {
     case "status": return status(request)
     case "setup": return try setup(request)
     case "event.list": return try listEvents(request)
     case "event.create": return try createOne(request, expectedKind: .event)
+    case "event.patch": return try patchOne(request, expectedKind: .event)
+    case "reminder.patch": return try patchOne(request, expectedKind: .reminder)
     case "event.update": return try updateOne(request, expectedKind: .event)
     case "event.delete": return try deleteOne(request, expectedKind: .event)
     case "reminder.list": return try listReminders(request)
@@ -48,6 +122,158 @@ final class EventKitService {
     case "batch.rollback": return try rollbackBatch(request)
     default: throw BridgeError.invalidRequest("未知 action：\(request.action)")
     }
+  }
+
+  private func recordedRollbackResponse(for id: String) throws -> BridgeResponse? {
+    guard let record = try journal.read("operation:rollback:" + id, as: OperationRecord.self) else {
+      return nil
+    }
+    var response: BridgeResponse
+    if let data = record.response {
+      response = try decoder.decode(BridgeResponse.self, from: data)
+    } else {
+      response = BridgeResponse(ok: false, status: "unknown",
+        message: record.error ?? "回滚结果待核查；不要重复写入。", batchId: id,
+        details: ["nextAction": "检查该批次回滚记录及 Apple 实际事项；不得重新执行回滚"])
+    }
+    var details = response.details ?? [:]
+    details["operation"] = "batch.rollback"
+    response.details = details
+    return response
+  }
+
+  private func reconcile(_ request: BridgeRequest) throws -> BridgeResponse {
+    guard let id = request.batchId else { throw BridgeError.notFound("缺少操作意图。") }
+    if let rollback = try recordedRollbackResponse(for: id) { return rollback }
+    guard var record = try journal.read("operation:" + id, as: OperationRecord.self),
+      let original = try journal.read("request:operation:" + id, as: BridgeRequest.self) else {
+      throw BridgeError.notFound("缺少操作意图。")
+    }
+    if record.state == "committed", let response = record.response { return try decoder.decode(BridgeResponse.self, from: response) }
+    let expected = original.action == "batch.commit" ? (original.items?.count ?? 0) : 1
+    let expectedAction: String?
+    switch original.action {
+    case "batch.commit", "event.create", "reminder.create": expectedAction = "create"
+    case "event.update", "event.patch", "reminder.update", "reminder.patch": expectedAction = "update"
+    case "event.delete", "reminder.delete": expectedAction = "delete"
+    case "reminder.complete": expectedAction = "complete"
+    default: expectedAction = nil
+    }
+    guard let expectedAction else { return unknownReconciliation(id: id, expected: expected, verified: []) }
+    let operations: [AuditOperation]
+    do { operations = try audit.operations(for: id) }
+    catch { return unknownReconciliation(id: id, expected: expected, verified: []) }
+    var verified: [ItemSummary] = []
+    do {
+      for operation in operations {
+        guard operation.action == expectedAction else {
+          return unknownReconciliation(id: id, expected: expected, verified: verified)
+        }
+        let after = try decodeSnapshot(operation.afterJSON)
+        let before = try decodeSnapshot(operation.beforeJSON)
+        guard let kind = ItemKind(rawValue: operation.entityType) else { continue }
+        switch operation.action {
+        case "create", "update", "complete":
+          guard let after else { continue }
+          try validateRecoverySnapshot(after, kind: kind)
+          let lookup = try recovery.lookup(id: operation.calendarItemId,
+            externalId: operation.externalId, snapshot: after, kind: kind)
+          if case .found(let item) = lookup {
+            let actual = try item.currentSnapshot()
+            if actual == after { verified.append(actual.summary) }
+          }
+        case "delete":
+          guard let before else { continue }
+          try validateRecoverySnapshot(before, kind: kind)
+          let lookup = try recovery.lookup(id: operation.calendarItemId,
+            externalId: operation.externalId, snapshot: before, kind: kind)
+          if case .absent = lookup { verified.append(before.summary) }
+        default: continue
+        }
+      }
+    } catch {
+      return unknownReconciliation(id: id, expected: expected, verified: verified)
+    }
+    guard expected > 0, operations.count == expected, verified.count == expected else {
+      return unknownReconciliation(id: id, expected: expected, verified: verified)
+    }
+    let response = BridgeResponse(ok: true, status: "committed", batchId: id, items: verified)
+    record.state = "committed"; record.response = try OperationJournal.encode(response)
+    try journal.write("operation:" + id, record)
+    return response
+  }
+
+  private func unknownReconciliation(id: String, expected: Int, verified: [ItemSummary]) -> BridgeResponse {
+    BridgeResponse(ok: false, status: "unknown", message: "无法证明全部写入完成；未重试或更改 Apple 事项。",
+      batchId: id, items: verified, details: ["expected": String(expected), "verified": String(verified.count),
+        "nextAction": "核查未完成写入意图；不要以新 batchId 重建"])
+  }
+
+  private func targetSnapshot(_ request: BridgeRequest) throws -> ItemSnapshot? {
+    guard let selector = request.selector else { return nil }
+    return try reliableSnapshot(findItem(selector, kind: request.action.hasPrefix("event.") ? .event : .reminder))
+  }
+  private func previewDigest(_ response: BridgeResponse) throws -> String {
+    let values = [response.items ?? [], response.conflicts ?? [], response.duplicates ?? []]
+    return OperationJournal.digest(try OperationJournal.encode(values.map { $0.sorted { $0.id < $1.id } }))
+  }
+
+  private func reliableSnapshot(_ item: EKCalendarItem, sourceRef: String? = nil) throws -> ItemSnapshot {
+    var result = snapshot(item, sourceRef: sourceRef)
+    if item is EKReminder {
+      result.summary.earlyReminder = try ReminderKitPrivateService.readEarlyReminder(reminderID: item.calendarItemIdentifier)
+    }
+    return result
+  }
+
+  private func recordIntent(_ batchId: String, action: String, before: ItemSnapshot?, draft: ItemDraft?) throws {
+    let key = "intents:" + batchId
+    var intents = try journal.read(key, as: [MutationIntent].self) ?? []
+    intents.append(MutationIntent(action: action, before: before, draft: draft))
+    try journal.write(key, intents)
+  }
+
+  private func requireRecoverable(_ item: EKCalendarItem) throws {
+    guard item.recurrenceRules?.isEmpty != false, (item as? EKEvent)?.isDetached != true else {
+      throw BridgeError.invalidRequest("暂不支持可恢复的重复系列修改；未写入。")
+    }
+  }
+
+  private func analysisDigest(_ drafts: [ItemDraft]) throws -> String {
+    var parts: [String] = []
+    for draft in drafts {
+      let result = try analyze(draft, excluding: nil)
+      let ids = (result.conflicts + result.duplicates).sorted { $0.id < $1.id }
+      parts.append(OperationJournal.digest(try OperationJournal.encode(ids)))
+      parts.append(draft.kind == .event ? try defaultEventCalendar().calendarIdentifier : try defaultReminderCalendar().calendarIdentifier)
+    }
+    return OperationJournal.digest(try OperationJournal.encode(parts))
+  }
+
+  private func patchOne(_ request: BridgeRequest, expectedKind: ItemKind) throws -> BridgeResponse {
+    guard let selector = request.selector, let patch = request.patch, let id = request.batchId else {
+      throw BridgeError.invalidRequest("patch 需要 selector、patch 和稳定 batchId。")
+    }
+    let existing = try findItem(selector, kind: expectedKind)
+    try requireRecoverable(existing)
+    let before = try reliableSnapshot(existing)
+    var draft = try patch.applying(to: snapshotToDraft(before))
+    if patch.alerts != nil || patch.clear?.contains("alerts") == true {
+      draft.earlyReminder = patch.earlyReminder
+    }
+    if patch.alerts != nil || patch.earlyReminder != nil || patch.clear?.contains("alerts") == true {
+      draft = try withResolvedAlerts(draft)
+    }
+    if request.dryRun == true {
+      try journal.write("patch:" + id, PatchPreview(before: before, draft: draft))
+    } else {
+      guard let saved = try journal.read("patch:" + id, as: PatchPreview.self),
+        saved.before == before, saved.draft == draft else {
+        throw BridgeError.confirmationRequired("原事项或修改内容已变化，重新预览。")
+      }
+    }
+    var update = request; update.item = draft
+    return try updateOne(update, expectedKind: expectedKind)
   }
 
   private func status(_ request: BridgeRequest) -> BridgeResponse {
@@ -113,6 +339,7 @@ final class EventKitService {
       throw BridgeError.invalidRequest("item.kind 与 action 不一致。")
     }
     draft = try withResolvedAlerts(draft)
+    if draft.kind == .reminder { try ReminderKitPrivateService.probe() }
     let analysis = try analyze(draft, excluding: nil)
     if request.dryRun == true
       || ((!analysis.conflicts.isEmpty || !analysis.duplicates.isEmpty)
@@ -145,8 +372,9 @@ final class EventKitService {
     guard draft.kind == expectedKind else {
       throw BridgeError.invalidRequest("item.kind 与 action 不一致。")
     }
-    draft = try withResolvedAlerts(draft)
+    if request.patch == nil { draft = try withResolvedAlerts(draft) }
     let existing = try findItem(selector, kind: expectedKind)
+    try requireRecoverable(existing)
     let analysis = try analyze(draft, excluding: existing.calendarItemIdentifier)
     if request.dryRun == true {
       return BridgeResponse(
@@ -170,14 +398,17 @@ final class EventKitService {
 
   private func deleteOne(_ request: BridgeRequest, expectedKind: ItemKind) throws -> BridgeResponse
   {
-    guard request.confirmed == true else { throw BridgeError.confirmationRequired("删除事项前必须确认。") }
     guard let selector = request.selector else {
       throw BridgeError.invalidRequest("delete 缺少 selector。")
     }
     let existing = try findItem(selector, kind: expectedKind)
+    try requireRecoverable(existing)
     let batchId = request.batchId ?? UUID().uuidString.lowercased()
+    let before = try reliableSnapshot(existing)
+    if request.dryRun == true { return BridgeResponse(ok: true, status: "preview", items: [before.summary]) }
+    guard request.confirmed == true else { throw BridgeError.confirmationRequired("删除前必须确认。") }
     try audit.beginBatch(id: batchId, action: request.action)
-    let before = snapshot(existing)
+    try recordIntent(batchId, action: "delete", before: before, draft: nil)
     try remove(existing, scope: request.scope)
     try audit.record(
       batchId: batchId,
@@ -194,22 +425,25 @@ final class EventKitService {
   }
 
   private func completeReminder(_ request: BridgeRequest) throws -> BridgeResponse {
-    guard request.confirmed == true else { throw BridgeError.confirmationRequired("完成待办前必须确认。") }
     guard let selector = request.selector else {
       throw BridgeError.invalidRequest("complete 缺少 selector。")
     }
     guard let reminder = try findItem(selector, kind: .reminder) as? EKReminder else {
       throw BridgeError.notFound("找不到待办。")
     }
+    try requireRecoverable(reminder)
     let batchId = request.batchId ?? UUID().uuidString.lowercased()
+    let before = try reliableSnapshot(reminder)
+    if request.dryRun == true { return BridgeResponse(ok: true, status: "preview", items: [before.summary]) }
+    guard request.confirmed == true else { throw BridgeError.confirmationRequired("完成前必须确认。") }
     try audit.beginBatch(id: batchId, action: request.action)
-    let before = snapshot(reminder)
+    try recordIntent(batchId, action: "complete", before: before, draft: nil)
     reminder.isCompleted = true
     reminder.completionDate = Date()
     do { try store.save(reminder, commit: true) } catch {
       throw BridgeError.eventKit(error.localizedDescription)
     }
-    let after = snapshot(reminder)
+    let after = try reliableSnapshot(reminder)
     try audit.record(
       batchId: batchId, action: "complete", entityType: .reminder,
       calendarItemId: reminder.calendarItemIdentifier,
@@ -243,33 +477,56 @@ final class EventKitService {
         }
       }
     }
+    let id = request.batchId ?? UUID().uuidString.lowercased()
+    for draft in drafts where draft.kind == .reminder { try ReminderKitPrivateService.probe() }
+    guard try journal.read("operation:" + id, as: OperationRecord.self) == nil else {
+      throw BridgeError.invalidRequest("batchId 已用于写入；请查询 operation.status。")
+    }
+    try journal.write("preview:" + id, BatchPreview(requested: rawItems, drafts: drafts,
+      analysis: try analysisDigest(drafts)))
     return BridgeResponse(
       ok: true,
       status: conflicts.isEmpty && duplicates.isEmpty ? "preview" : "needs_confirmation",
       requestId: request.requestId,
-      batchId: request.batchId ?? UUID().uuidString.lowercased(),
+      batchId: id,
       items: drafts.enumerated().map { draftSummary($0.element, id: "draft-\($0.offset + 1)") },
       conflicts: unique(conflicts),
       duplicates: unique(duplicates)
     )
   }
 
-  private func commitBatch(_ request: BridgeRequest) throws -> BridgeResponse {
+  private func checkedBatch(_ request: BridgeRequest) throws -> [ItemDraft] {
     guard request.confirmed == true else { throw BridgeError.confirmationRequired("批量写入前必须确认预览。") }
     guard let rawItems = request.items, !rawItems.isEmpty else {
       throw BridgeError.invalidRequest("batch.commit 需要非空 items。")
     }
-    let batchId = request.batchId ?? UUID().uuidString.lowercased()
+    guard let batchId = request.batchId,
+      let preview = try journal.read("preview:" + batchId, as: BatchPreview.self) else {
+      throw BridgeError.invalidRequest("缺少已保存预览；请先 batch.preview。")
+    }
+    let normalized = preview.drafts
+    guard rawItems == preview.drafts || rawItems == preview.requested else { throw BridgeError.invalidRequest("内容与预览不符；重新预览。") }
+    guard try analysisDigest(normalized) == preview.analysis else {
+      throw BridgeError.confirmationRequired("冲突或目标容器已变化；重新预览。")
+    }
+    for draft in normalized where draft.kind == .reminder { try ReminderKitPrivateService.probe() }
+    return normalized
+  }
+
+  private func commitBatch(_ request: BridgeRequest) throws -> BridgeResponse {
+    let normalized = try checkedBatch(request)
+    let batchId = request.batchId!
     try audit.beginBatch(id: batchId, action: request.action)
     var created: [ItemSummary] = []
     do {
-      for raw in rawItems {
-        let draft = try withResolvedAlerts(CalendarRules.validated(raw))
+      for draft in normalized {
         created.append(try create(draft, batchId: batchId))
       }
     } catch {
-      _ = try? rollback(batchId)
-      throw error
+      let original = String(describing: error)
+      do { _ = try rollback(batchId) }
+      catch { throw BridgeError.eventKit("原始错误：\(original)；回滚错误：\(error)；结果待核查。") }
+      throw BridgeError.eventKit("\(original)；已记录操作已回滚，仍须核查未完成的写入意图。")
     }
     return BridgeResponse(
       ok: true, status: "committed", requestId: request.requestId, batchId: batchId, items: created)
@@ -281,6 +538,11 @@ final class EventKitService {
       throw BridgeError.invalidRequest("batch.rollback 缺少 batchId。")
     }
     let restored = try rollback(batchId)
+    if var original = try journal.read("operation:" + batchId, as: OperationRecord.self) {
+      original.state = "rolled_back"
+      original.response = try OperationJournal.encode(BridgeResponse(ok: true, status: "rolled_back", batchId: batchId, items: restored))
+      try journal.write("operation:" + batchId, original)
+    }
     return BridgeResponse(
       ok: true, status: "rolled_back", requestId: request.requestId, batchId: batchId,
       items: restored)
@@ -293,36 +555,115 @@ final class EventKitService {
     for operation in operations {
       let before = try decodeSnapshot(operation.beforeJSON)
       let after = try decodeSnapshot(operation.afterJSON)
-      let kind =
-        ItemKind(rawValue: operation.entityType) ?? before?.summary.kind ?? after?.summary.kind
-      guard let kind else { continue }
+      guard let kind = ItemKind(rawValue: operation.entityType) else {
+        throw BridgeError.eventKit("审计事项类型未知；停止回滚。")
+      }
+      let progressKey = "rollback-step:\(batchId):\(operation.id)"
+      if let state = try journal.read(progressKey, as: String.self) {
+        if state == "done" { continue }
+        throw BridgeError.eventKit("回滚步骤 \(operation.id) 结果待核查，未重复执行。")
+      }
       switch operation.action {
       case "create":
-        if let item = try findRecordedItem(
-          id: operation.calendarItemId, snapshot: after, kind: kind)
-        {
-          try remove(item, scope: "future")
-          results.append(summary(item))
+        guard let after else { throw BridgeError.eventKit("创建审计缺少写入后快照；停止回滚。") }
+        try validateRecoverySnapshot(after, kind: kind)
+        let lookup = try recovery.lookup(id: operation.calendarItemId,
+          externalId: operation.externalId, snapshot: after, kind: kind)
+        switch lookup {
+        case .found(let item):
+          guard try item.currentSnapshot() == after else {
+            throw BridgeError.confirmationRequired("事项在写入后已变化；停止回滚。")
+          }
+          guard let externalId = operation.externalId ?? after.summary.externalId,
+            !externalId.isEmpty else {
+            throw BridgeError.eventKit("缺少外部标识，无法验证删除后的缺席；停止回滚。")
+          }
+          try journal.write(progressKey, "executing")
+          try item.remove("future")
+          let check = try recovery.lookup(id: operation.calendarItemId,
+            externalId: operation.externalId, snapshot: after, kind: kind)
+          guard case .absent = check else { throw BridgeError.eventKit("删除后未能证明事项消失。") }
+        case .absent:
+          try journal.write(progressKey, "executing")
         }
+        results.append(after.summary)
       case "update", "complete":
-        guard let before else { continue }
-        if let item = try findRecordedItem(
-          id: operation.calendarItemId, snapshot: after, kind: kind)
-        {
-          results.append(try restore(before, onto: item))
-        } else {
-          results.append(try create(snapshotToDraft(before), batchId: nil))
+        guard let before, let after else {
+          throw BridgeError.eventKit("修改审计缺少快照；停止回滚。")
         }
+        try validateRecoverySnapshot(before, kind: kind)
+        try validateRecoverySnapshot(after, kind: kind)
+        try recovery.validateRestoreContainer(before)
+        let lookup = try recovery.lookup(id: operation.calendarItemId,
+          externalId: operation.externalId, snapshot: after, kind: kind)
+        guard case .found(let item) = lookup else {
+          throw BridgeError.confirmationRequired("原事项已消失；停止回滚，避免重建用户删除的事项。")
+        }
+        guard try item.currentSnapshot() == after else {
+          throw BridgeError.confirmationRequired("事项在写入后已变化；停止回滚。")
+        }
+        try journal.write(progressKey, "executing")
+        let restored = try item.restore(before)
+        let check = try recovery.lookup(id: restored.id,
+          externalId: restored.externalId, snapshot: before, kind: kind)
+        guard case .found(let checked) = check,
+          try checked.currentSnapshot() == before else {
+          throw BridgeError.eventKit("恢复后回读不一致；结果待核查。")
+        }
+        results.append(restored)
       case "delete":
-        if let before { results.append(try create(snapshotToDraft(before), batchId: nil)) }
-      default: continue
+        guard let before, after == nil else {
+          throw BridgeError.eventKit("删除审计缺少可靠快照；停止回滚。")
+        }
+        try validateRecoverySnapshot(before, kind: kind)
+        try recovery.validateRestoreContainer(before)
+        let lookup = try recovery.lookup(id: operation.calendarItemId,
+          externalId: operation.externalId, snapshot: before, kind: kind)
+        switch lookup {
+        case .found(let item):
+          guard try item.currentSnapshot() == before else {
+            throw BridgeError.confirmationRequired("原事项已变化；停止回滚。")
+          }
+          try journal.write(progressKey, "executing")
+          results.append(before.summary)
+        case .absent:
+          try journal.write(progressKey, "executing")
+          let restored = try recovery.recreateDeleted(before)
+          let check = try recovery.lookup(id: restored.id,
+            externalId: restored.externalId, snapshot: before, kind: kind)
+          guard case .found(let item) = check,
+            try sameRestoredContent(item.currentSnapshot(), before) else {
+            throw BridgeError.eventKit("重建后回读不一致；结果待核查。")
+          }
+          results.append(restored)
+        }
+      default:
+        throw BridgeError.eventKit("审计动作未知；停止回滚。")
       }
+      try journal.write(progressKey, "done")
     }
     try audit.markRolledBack(batchId)
     return results
   }
 
+  private func validateRecoverySnapshot(_ snapshot: ItemSnapshot, kind: ItemKind) throws {
+    guard snapshot.summary.kind == kind,
+      let container = snapshot.calendarIdentifier, !container.isEmpty,
+      kind != .reminder || snapshot.summary.completed != nil else {
+      throw BridgeError.eventKit("旧快照缺少原容器或完成状态；停止恢复。")
+    }
+  }
+
+  private func sameRestoredContent(_ actual: ItemSnapshot, _ original: ItemSnapshot) -> Bool {
+    var normalized = actual
+    normalized.summary.id = original.summary.id
+    normalized.summary.externalId = original.summary.externalId
+    return normalized == original
+  }
+
   private func create(_ draft: ItemDraft, batchId: String?) throws -> ItemSummary {
+    if draft.kind == .reminder { try ReminderKitPrivateService.probe() }
+    if let batchId { try recordIntent(batchId, action: "create", before: nil, draft: draft) }
     switch draft.kind {
     case .event:
       try requireAccess(.event)
@@ -332,7 +673,7 @@ final class EventKitService {
       do { try store.save(event, span: .thisEvent, commit: true) } catch {
         throw BridgeError.eventKit(error.localizedDescription)
       }
-      let after = snapshot(event, sourceRef: draft.sourceRef)
+      let after = try reliableSnapshot(event, sourceRef: draft.sourceRef)
       if let batchId {
         try audit.record(
           batchId: batchId, action: "create", entityType: .event,
@@ -355,7 +696,7 @@ final class EventKitService {
         try? store.remove(reminder, commit: true)
         throw error
       }
-      var after = snapshot(reminder, sourceRef: draft.sourceRef)
+      var after = try reliableSnapshot(reminder, sourceRef: draft.sourceRef)
       after.summary.earlyReminder = draft.earlyReminder
       if let batchId {
         try audit.record(
@@ -370,7 +711,9 @@ final class EventKitService {
   private func update(
     _ existing: EKCalendarItem, with draft: ItemDraft, batchId: String, scope: String?
   ) throws -> ItemSummary {
-    let before = snapshot(existing)
+    let before = try reliableSnapshot(existing)
+    if draft.kind == .reminder { try ReminderKitPrivateService.probe() }
+    try recordIntent(batchId, action: "update", before: before, draft: draft)
     if let event = existing as? EKEvent {
       try apply(draft, to: event)
       do { try store.save(event, span: eventSpan(scope), commit: true) } catch {
@@ -384,7 +727,7 @@ final class EventKitService {
       try ReminderKitPrivateService.setEarlyReminder(
         reminderID: reminder.calendarItemIdentifier, spec: draft.earlyReminder)
     }
-    var after = snapshot(existing, sourceRef: draft.sourceRef)
+    var after = try reliableSnapshot(existing, sourceRef: draft.sourceRef)
     if draft.kind == .reminder {
       after.summary.earlyReminder = draft.earlyReminder
     }
@@ -639,15 +982,82 @@ final class EventKitService {
     return match
   }
 
-  private func findRecordedItem(id: String?, snapshot: ItemSnapshot?, kind: ItemKind) throws
-    -> EKCalendarItem?
+  package func lookup(id: String?, externalId: String?, snapshot: ItemSnapshot?, kind: ItemKind)
+    throws -> RecordedLookup
   {
-    if let id, let item = store.calendarItem(withIdentifier: id) { return item }
-    guard let snapshot else { return nil }
-    return try? findItem(
-      ItemSelector(
-        title: snapshot.summary.title, near: snapshot.summary.start ?? snapshot.summary.due),
-      kind: kind)
+    guard let snapshot else { throw BridgeError.eventKit("缺少来源快照；无法确认事项身份。") }
+    try validateRecoverySnapshot(snapshot, kind: kind)
+    let calendar = try originalCalendar(snapshot)
+    guard let id = id ?? (snapshot.summary.id.isEmpty ? nil : snapshot.summary.id) else {
+      throw BridgeError.eventKit("缺少事项标识；无法确认其已消失。")
+    }
+    store.refreshSourcesIfNecessary()
+    if let item = store.calendarItem(withIdentifier: id) {
+      guard ((kind == .event && item is EKEvent) || (kind == .reminder && item is EKReminder)),
+        item.calendar?.calendarIdentifier == calendar.calendarIdentifier else {
+        throw BridgeError.eventKit("事项类型或原容器不匹配；结果待核查。")
+      }
+      return .found(RecordedItem(
+        currentSnapshot: { try self.reliableSnapshot(item, sourceRef: snapshot.sourceRef) },
+        remove: { scope in
+          try self.requireRecoverable(item)
+          try self.remove(item, scope: scope)
+        },
+        restore: { before in try self.restore(before, onto: item) }
+      ))
+    }
+    guard let externalId = externalId ?? snapshot.summary.externalId, !externalId.isEmpty else {
+      throw BridgeError.eventKit("缺少外部标识，无法证明事项已消失。")
+    }
+    if !store.calendarItems(withExternalIdentifier: externalId).isEmpty {
+      throw BridgeError.eventKit("外部标识仍有匹配事项；无法证明原事项已消失。")
+    }
+    return .absent
+  }
+
+  package func validateRestoreContainer(_ snapshot: ItemSnapshot) throws {
+    try validateRecoverySnapshot(snapshot, kind: snapshot.summary.kind)
+    _ = try originalCalendar(snapshot)
+    if snapshot.summary.kind == .reminder { try ReminderKitPrivateService.probe() }
+    _ = try CalendarRules.validated(snapshotToDraft(snapshot))
+  }
+
+  private func originalCalendar(_ snapshot: ItemSnapshot) throws -> EKCalendar {
+    let kind = snapshot.summary.kind
+    try requireAccess(kind == .event ? .event : .reminder)
+    guard let identifier = snapshot.calendarIdentifier,
+      let calendar = store.calendar(withIdentifier: identifier),
+      calendar.allowedEntityTypes.contains(kind == .event ? .event : .reminder),
+      calendar.allowsContentModifications else {
+      throw BridgeError.eventKit("原容器不可用、类型不符或不可写；停止恢复。")
+    }
+    return calendar
+  }
+
+  package func recreateDeleted(_ snapshot: ItemSnapshot) throws -> ItemSummary {
+    try validateRestoreContainer(snapshot)
+    let calendar = try originalCalendar(snapshot)
+    let draft = try CalendarRules.validated(snapshotToDraft(snapshot))
+    switch draft.kind {
+    case .event:
+      let event = EKEvent(eventStore: store)
+      event.calendar = calendar
+      try apply(draft, to: event)
+      do { try store.save(event, span: .thisEvent, commit: true) }
+      catch { throw BridgeError.eventKit(error.localizedDescription) }
+      return try reliableSnapshot(event, sourceRef: snapshot.sourceRef).summary
+    case .reminder:
+      let reminder = EKReminder(eventStore: store)
+      reminder.calendar = calendar
+      try apply(draft, to: reminder)
+      reminder.isCompleted = snapshot.summary.completed!
+      reminder.completionDate = snapshot.summary.completed == true ? Date() : nil
+      do { try store.save(reminder, commit: true) }
+      catch { throw BridgeError.eventKit(error.localizedDescription) }
+      try ReminderKitPrivateService.setEarlyReminder(
+        reminderID: reminder.calendarItemIdentifier, spec: draft.earlyReminder)
+      return try reliableSnapshot(reminder, sourceRef: snapshot.sourceRef).summary
+    }
   }
 
   private func remove(_ item: EKCalendarItem, scope: String?) throws {
@@ -661,22 +1071,28 @@ final class EventKitService {
   }
 
   private func restore(_ snapshot: ItemSnapshot, onto item: EKCalendarItem) throws -> ItemSummary {
+    try validateRestoreContainer(snapshot)
+    let calendar = try originalCalendar(snapshot)
+    try requireRecoverable(item)
     let draft = snapshotToDraft(snapshot)
     if let event = item as? EKEvent {
+      event.calendar = calendar
       try apply(draft, to: event)
       do { try store.save(event, span: .thisEvent, commit: true) } catch {
         throw BridgeError.eventKit(error.localizedDescription)
       }
     } else if let reminder = item as? EKReminder {
+      reminder.calendar = calendar
       try apply(draft, to: reminder)
-      reminder.isCompleted = snapshot.summary.completed ?? false
+      reminder.isCompleted = snapshot.summary.completed!
+      reminder.completionDate = snapshot.summary.completed == true ? Date() : nil
       do { try store.save(reminder, commit: true) } catch {
         throw BridgeError.eventKit(error.localizedDescription)
       }
       try ReminderKitPrivateService.setEarlyReminder(
         reminderID: reminder.calendarItemIdentifier, spec: draft.earlyReminder)
     }
-    return summary(item)
+    return try reliableSnapshot(item, sourceRef: snapshot.sourceRef).summary
   }
 
   private func snapshotToDraft(_ snapshot: ItemSnapshot) -> ItemDraft {
@@ -746,6 +1162,7 @@ final class EventKitService {
   private func snapshot(_ item: EKCalendarItem, sourceRef: String? = nil) -> ItemSnapshot {
     ItemSnapshot(
       summary: summary(item),
+      calendarIdentifier: item.calendar?.calendarIdentifier,
       location: item.location,
       notes: item.notes,
       url: item.url?.absoluteString,
@@ -807,11 +1224,13 @@ final class EventKitService {
 
   private func verifiedSummary(id: String, fallback: ItemSummary) throws -> ItemSummary {
     store.refreshSourcesIfNecessary()
-    guard let item = store.calendarItem(withIdentifier: id) else { return fallback }
+    guard let item = store.calendarItem(withIdentifier: id) else {
+      throw BridgeError.eventKit("写入后无法回读 \(id)，结果待核查。")
+    }
     let actual = summary(item)
     if fallback.kind == .reminder, fallback.earlyReminder != nil {
       var adjusted = actual
-      adjusted.earlyReminder = fallback.earlyReminder
+      adjusted.earlyReminder = try ReminderKitPrivateService.readEarlyReminder(reminderID: id)
       return adjusted
     }
     if actual.alerts.count < fallback.alerts.count {
@@ -855,7 +1274,9 @@ final class EventKitService {
       box.set(reminders ?? [])
       semaphore.signal()
     }
-    semaphore.wait()
+    guard semaphore.wait(timeout: .now() + 30) == .success else {
+      throw BridgeError.eventKit("系统请求超时；不要在原请求仍等待时重试。")
+    }
     return box.get() ?? []
   }
 
@@ -871,7 +1292,9 @@ final class EventKitService {
     } else {
       store.requestFullAccessToReminders(completion: completion)
     }
-    semaphore.wait()
+    guard semaphore.wait(timeout: .now() + 30) == .success else {
+      throw BridgeError.eventKit("系统请求超时；不要在原请求仍等待时重试。")
+    }
     switch box.get() {
     case .success(let granted): return granted
     case .failure(let error): throw BridgeError.permissionDenied(error.localizedDescription)
@@ -887,7 +1310,8 @@ final class EventKitService {
 
   private func defaultEventCalendar() throws -> EKCalendar {
     try requireAccess(.event)
-    guard let calendar = store.defaultCalendarForNewEvents else {
+    let selected = try BridgeConfiguration.load().eventCalendarId
+    guard let calendar = selected == nil ? store.defaultCalendarForNewEvents : store.calendars(for: .event).first(where: { $0.calendarIdentifier == selected }) else {
       throw BridgeError.eventKit("没有默认日历。")
     }
     guard isICloud(calendar.source) else {
@@ -899,7 +1323,8 @@ final class EventKitService {
 
   private func defaultReminderCalendar() throws -> EKCalendar {
     try requireAccess(.reminder)
-    guard let calendar = store.defaultCalendarForNewReminders() else {
+    let selected = try BridgeConfiguration.load().reminderCalendarId
+    guard let calendar = selected == nil ? store.defaultCalendarForNewReminders() : store.calendars(for: .reminder).first(where: { $0.calendarIdentifier == selected }) else {
       throw BridgeError.eventKit("没有默认提醒事项列表。")
     }
     guard isICloud(calendar.source) else {
@@ -932,4 +1357,25 @@ final class EventKitService {
     guard let json, let data = json.data(using: .utf8) else { return nil }
     return try decoder.decode(ItemSnapshot.self, from: data)
   }
+}
+
+private struct BatchPreview: Codable {
+  var requested: [ItemDraft]
+  var drafts: [ItemDraft]
+  var analysis: String
+}
+private struct MutationIntent: Codable {
+  var action: String
+  var before: ItemSnapshot?
+  var draft: ItemDraft?
+}
+private struct PatchPreview: Codable {
+  var before: ItemSnapshot
+  var draft: ItemDraft
+}
+
+private struct SinglePreview: Codable {
+  var digest: String
+  var before: ItemSnapshot?
+  var analysis: String
 }

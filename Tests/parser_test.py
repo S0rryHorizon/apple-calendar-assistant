@@ -40,10 +40,7 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(result["records"][0]["alerts"][0]["trigger"], "-PT60M")
 
     def test_xlsx(self):
-        try:
-            import openpyxl
-        except ImportError:
-            self.skipTest("openpyxl is unavailable")
+        import openpyxl
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "schedule.xlsx"
             workbook = openpyxl.Workbook()

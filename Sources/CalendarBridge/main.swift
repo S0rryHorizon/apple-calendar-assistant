@@ -1,4 +1,5 @@
 import CalendarBridgeCore
+import CalendarBridgeRuntime
 import Foundation
 
 private func inputData() throws -> Data {
@@ -37,6 +38,12 @@ private func emit(_ response: BridgeResponse) {
 do {
   let data = try inputData()
   let request = try JSONDecoder().decode(BridgeRequest.self, from: data)
+  if request.action == "diagnostics" {
+    var response = BridgeResponse(ok: true, status: "ok")
+    response.details = try InstallationDiagnostics.read(support: "CalendarBridge")
+    emit(response)
+    exit(0)
+  }
   let service = try EventKitService()
   emit(try service.handle(request))
 } catch {
