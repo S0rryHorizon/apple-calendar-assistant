@@ -10,6 +10,7 @@ let package = Package(
   ],
   targets: [
     .target(name: "CalendarBridgeCore"),
+    .executableTarget(name: "CalendarBridgeReliabilityTests", dependencies: ["CalendarBridgeCore"], path: "Tests/ReliabilityTests"),
     .executableTarget(
       name: "CalendarBridge",
       dependencies: ["CalendarBridgeCore"],

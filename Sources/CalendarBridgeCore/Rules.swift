@@ -1,7 +1,7 @@
 import Foundation
 
 public enum CalendarRules {
-  public static let defaultTimeZoneIdentifier = "Asia/Singapore"
+  public static var defaultTimeZoneIdentifier: String { (try? BridgeConfiguration.load().timezone) ?? "Asia/Singapore" }
 
   public static func parseDate(
     _ value: String, timeZoneIdentifier: String = defaultTimeZoneIdentifier
@@ -63,7 +63,7 @@ public enum CalendarRules {
           throw BridgeError.invalidRequest("事件结束时间必须晚于开始时间。")
         }
       } else {
-        let seconds: TimeInterval = item.allDay == true ? 86_400 : 3_600
+        let seconds: TimeInterval = item.allDay == true ? 86_400 : Double((try BridgeConfiguration.load().defaultDurationMinutes ?? 60) * 60)
         item.end = formatDate(start.addingTimeInterval(seconds), timeZoneIdentifier: timezone)
       }
     case .reminder:
@@ -124,7 +124,7 @@ public enum CalendarRules {
     calendar.timeZone = timezone
     let referenceDay = calendar.startOfDay(for: referenceDate)
     guard let previousDay = calendar.date(byAdding: .day, value: -1, to: referenceDay),
-      let defaultAlert = calendar.date(bySettingHour: 22, minute: 0, second: 0, of: previousDay)
+      let defaultAlert = calendar.date(bySettingHour: try BridgeConfiguration.load().defaultAlertHour ?? 22, minute: try BridgeConfiguration.load().defaultAlertMinute ?? 0, second: 0, of: previousDay)
     else {
       throw BridgeError.invalidRequest("无法计算默认提醒时间。")
     }

@@ -33,6 +33,37 @@ enum ReminderKitPrivateService {
     } else {
       command["clear"] = true
     }
+    _ = try invoke(command)
+    guard try readEarlyReminder(reminderID: reminderID) == spec else {
+      throw BridgeError.eventKit("原生提前提醒回读与请求不一致；结果待核查。")
+    }
+  }
+
+  static func readEarlyReminder(reminderID: String) throws -> EarlyReminderSpec? {
+    let response = try invoke(["action": "read_early_reminder", "id": reminderID])
+    guard response["status"] as? String == "read", response.keys.contains("earlyReminder") else {
+      throw BridgeError.eventKit("原生提前提醒无法可靠回读；未继续写入。")
+    }
+    if response["earlyReminder"] is NSNull { return nil }
+    guard let value = response["earlyReminder"] as? [String: Int], let unit = value["unit"], let count = value["count"] else {
+      throw BridgeError.eventKit("原生提前提醒响应格式无效。")
+    }
+    return EarlyReminderSpec(unit: unit, count: count)
+  }
+
+  static func probe() throws {
+    let response = try invoke(["action": "probe"])
+    guard response["status"] as? String == "available" else {
+      throw BridgeError.eventKit("原生提前提醒不可用；未写入提醒事项。")
+    }
+  }
+
+  private static func invoke(_ command: [String: Any]) throws -> [String: Any] {
+    let path = ProcessInfo.processInfo.environment["CALENDAR_BRIDGE_PRIVATE_PATH"] ?? defaultExecutable.path
+    let executable = URL(fileURLWithPath: path)
+    guard FileManager.default.isExecutableFile(atPath: path) else {
+      throw BridgeError.eventKit("缺少原生提前提醒辅助程序；未写入提醒事项。")
+    }
     let input = try JSONSerialization.data(withJSONObject: command, options: [])
 
     let process = Process()
@@ -46,7 +77,12 @@ enum ReminderKitPrivateService {
     try process.run()
     stdin.fileHandleForWriting.write(input)
     stdin.fileHandleForWriting.closeFile()
-    process.waitUntilExit()
+    let deadline = Date().addingTimeInterval(15)
+    while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+    if process.isRunning {
+      process.terminate()
+      throw BridgeError.eventKit("原生提醒辅助程序超时，结果待核查；不要重试。")
+    }
 
     let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
     let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
@@ -57,10 +93,13 @@ enum ReminderKitPrivateService {
         ?? "CalendarBridgePrivate 退出码 \(process.terminationStatus)。"
       throw BridgeError.eventKit(message.trimmingCharacters(in: .whitespacesAndNewlines))
     }
-    if let response = try? JSONSerialization.jsonObject(with: outputData) as? [String: Any],
-      let status = response["status"] as? String, status == "error"
-    {
+    guard let response = try JSONSerialization.jsonObject(with: outputData) as? [String: Any],
+      let status = response["status"] as? String else {
+      throw BridgeError.eventKit("辅助程序响应无效；结果待核查。")
+    }
+    if status == "error" {
       throw BridgeError.eventKit(response["message"] as? String ?? "CalendarBridgePrivate 写入失败。")
     }
+    return response
   }
 }

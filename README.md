@@ -66,8 +66,14 @@ python3 -m unittest Tests/parser_test.py
 提醒事项的“提前提醒”不是 EventKit 的普通 alarm。Bridge 对单条提醒使用
 `CalendarBridgePrivate` 写入 iCloud Reminders 的原生 Early Reminder 字段，因此
 iPhone 会同时显示正确的截止日期和“提前提醒”；该辅助程序使用当前 macOS 的
-ReminderKit 私有接口，若系统升级后失效，重新运行安装脚本即可重建。
+ReminderKit 私有接口，若系统升级后失效，可能需要适配私有接口；重新编译不保证恢复。
 
 ## 开源许可
 
 本项目采用 MIT License，详见 `LICENSE`。
+
+## Protocol 2 reliability upgrade
+
+All writes now require a stable operation ID and matching preview. Partial changes use `event.patch` / `reminder.patch`. Unknown results are inspected with `operation.status` / `operation.reconcile`; repeated requests do not recreate items. Recurring-item mutations are blocked until complete recovery can be guaranteed.
+
+Install Bridge and skill together using `scripts/install.sh`. The installer stages, verifies and replaces the app/skill, rolls back failures, and records hashes in a private installation manifest. Configuration remains outside the installed skill. `diagnostics` checks installation without asking for permissions. See `docs/RELIABILITY.md` for validation and remaining live checks.
