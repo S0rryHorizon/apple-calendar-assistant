@@ -263,6 +263,7 @@ public struct BridgeResponse: Codable, Sendable {
 
 public struct ItemSnapshot: Codable, Equatable, Sendable {
   public var summary: ItemSummary
+  public var calendarIdentifier: String?
   public var location: String?
   public var notes: String?
   public var url: String?
@@ -271,6 +272,7 @@ public struct ItemSnapshot: Codable, Equatable, Sendable {
 
   public init(
     summary: ItemSummary,
+    calendarIdentifier: String? = nil,
     location: String? = nil,
     notes: String? = nil,
     url: String? = nil,
@@ -278,6 +280,7 @@ public struct ItemSnapshot: Codable, Equatable, Sendable {
     sourceRef: String? = nil
   ) {
     self.summary = summary
+    self.calendarIdentifier = calendarIdentifier
     self.location = location
     self.notes = notes
     self.url = url

@@ -2,8 +2,8 @@ import CalendarBridgeCore
 import Foundation
 import SQLite3
 
-struct AuditOperation {
-  let id: Int64
+package struct AuditOperation {
+  package let id: Int64
   let batchId: String
   let action: String
   let entityType: String
@@ -13,7 +13,7 @@ struct AuditOperation {
   let afterJSON: String?
 }
 
-final class AuditStore {
+package final class AuditStore {
   private var db: OpaquePointer?
   private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -24,9 +24,9 @@ final class AuditStore {
     return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CalendarBridge")
   }
 
-  init() throws {
+  package init(directory: URL? = nil) throws {
     let manager = FileManager.default
-    let base = Self.baseDirectory
+    let base = directory ?? Self.baseDirectory
     try manager.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let path = base.appendingPathComponent("operations.sqlite").path
     guard sqlite3_open(path, &db) == SQLITE_OK else {
@@ -77,7 +77,7 @@ final class AuditStore {
 
   deinit { sqlite3_close(db) }
 
-  func beginBatch(id: String, action: String) throws {
+  package func beginBatch(id: String, action: String) throws {
     let sql = "INSERT INTO batches(id, action, created_at) VALUES(?, ?, ?);"
     try withStatement(sql) { statement in
       bind(id, at: 1, in: statement)
@@ -87,7 +87,7 @@ final class AuditStore {
     }
   }
 
-  func record(
+  package func record(
     batchId: String,
     action: String,
     entityType: ItemKind,
@@ -121,7 +121,7 @@ final class AuditStore {
     }
   }
 
-  func operations(for batchId: String) throws -> [AuditOperation] {
+  package func operations(for batchId: String) throws -> [AuditOperation] {
     let sql = """
       SELECT o.id, o.batch_id, o.action, o.entity_type, o.calendar_item_id,
              o.external_id, o.before_json, o.after_json
@@ -149,7 +149,7 @@ final class AuditStore {
     }
   }
 
-  func markRolledBack(_ batchId: String) throws {
+  package func markRolledBack(_ batchId: String) throws {
     try withStatement("UPDATE batches SET rolled_back = 1 WHERE id = ?;") { statement in
       bind(batchId, at: 1, in: statement)
       try stepDone(statement)
