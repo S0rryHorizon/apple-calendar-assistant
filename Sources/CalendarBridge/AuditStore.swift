@@ -32,10 +32,11 @@ package final class AuditStore {
     guard sqlite3_open(path, &db) == SQLITE_OK else {
       throw BridgeError.storage("无法打开本地操作数据库：\(lastError)")
     }
-    var statement: OpaquePointer?
-    sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &statement, nil)
-    let version = sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int(statement, 0) : 0
-    sqlite3_finalize(statement)
+    let version = try withStatement("PRAGMA user_version;") { statement in
+      var version: Int32 = 0
+      while try stepRow(statement) { version = sqlite3_column_int(statement, 0) }
+      return version
+    }
     if version < 2 {
       let backupPath = base.appendingPathComponent("operations-before-v2-" + UUID().uuidString + ".sqlite").path
       var destination: OpaquePointer?
@@ -132,7 +133,7 @@ package final class AuditStore {
     return try withStatement(sql) { statement in
       bind(batchId, at: 1, in: statement)
       var result: [AuditOperation] = []
-      while sqlite3_step(statement) == SQLITE_ROW {
+      while try stepRow(statement) {
         result.append(
           AuditOperation(
             id: sqlite3_column_int64(statement, 0),
@@ -181,6 +182,14 @@ package final class AuditStore {
       sqlite3_bind_text(statement, index, value, -1, transient)
     } else {
       sqlite3_bind_null(statement, index)
+    }
+  }
+
+  private func stepRow(_ statement: OpaquePointer) throws -> Bool {
+    switch sqlite3_step(statement) {
+    case SQLITE_ROW: return true
+    case SQLITE_DONE: return false
+    default: throw BridgeError.storage(lastError)
     }
   }
 

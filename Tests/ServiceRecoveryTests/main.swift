@@ -1,6 +1,7 @@
 import CalendarBridgeCore
 import CalendarBridgeRuntime
 import Foundation
+import SQLite3
 
 private struct TestFailure: Error, CustomStringConvertible {
   let description: String
@@ -322,7 +323,84 @@ private func testOriginalQueriesWithoutRollbackKeepTheirReceipt() throws {
   try expect(h.backend.lookupCount == 0, "stored original receipt should not access the backend")
 }
 
+private func auditSQL(_ h: Harness, _ sql: String) throws {
+  var db: OpaquePointer?
+  let code = sqlite3_open(h.directory.appendingPathComponent("audit/operations.sqlite").path, &db)
+  defer { sqlite3_close(db) }
+  try expect(code == SQLITE_OK, "open synthetic audit database")
+  guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+    throw TestFailure(description: String(cString: sqlite3_errmsg(db)))
+  }
+}
+
+private func injectAuditReadFailure(_ h: Harness) throws {
+  // This flattenable view preserves the primary-key scan. Row 3 is returned;
+  // evaluating row 2 then fails, without changing the production connection API.
+  try auditSQL(h, """
+    ALTER TABLE operations RENAME TO stored_operations;
+    CREATE VIEW operations AS
+    SELECT id, batch_id, action, entity_type, calendar_item_id, external_id,
+           CASE WHEN id = 2 THEN abs(-9223372036854775808) ELSE before_json END AS before_json,
+           after_json, created_at
+    FROM stored_operations;
+    """)
+}
+
+private func clearAuditReadFailure(_ h: Harness) throws {
+  try auditSQL(h, """
+    DROP VIEW operations;
+    ALTER TABLE stored_operations RENAME TO operations;
+    """)
+}
+
+private func recordAuditReadBatch(_ h: Harness) throws {
+  try h.audit.beginBatch(id: "read-failure", action: "create")
+  for index in 1...3 {
+    let after = snapshot(.event, id: "created-\(index)", container: "calendar-A")
+    try h.audit.record(batchId: "read-failure", action: "create", entityType: .event,
+      calendarItemId: after.summary.id, externalId: after.summary.externalId,
+      before: nil, after: after)
+    h.backend.items[after.summary.id] = after
+  }
+}
+
+private func testAuditReadNeverReturnsPartialOperations() throws {
+  let h = try Harness(); defer { h.cleanUp() }
+  try expect(try h.audit.operations(for: "missing").isEmpty, "missing batch should remain empty")
+  try recordAuditReadBatch(h)
+  let ids = try h.audit.operations(for: "read-failure").map(\.id)
+  try expect(ids == [3, 2, 1], "successful audit read should preserve reverse order")
+  try injectAuditReadFailure(h)
+  do {
+    let partial = try h.audit.operations(for: "read-failure")
+    throw TestFailure(description: "audit read returned \(partial.count) of 3 operations instead of throwing")
+  } catch BridgeError.storage(let message) {
+    try expect(message == "integer overflow", "read must preserve SQLite's step error")
+  }
+  try clearAuditReadFailure(h)
+  try expect(try h.audit.operations(for: "read-failure").map(\.id) == ids,
+    "failed read must finalize its statement and preserve every operation")
+}
+
+private func testAuditReadFailureStopsRollbackBeforeRecovery() throws {
+  let h = try Harness(); defer { h.cleanUp() }
+  try recordAuditReadBatch(h)
+  try injectAuditReadFailure(h)
+  let result = try h.rollback("read-failure")
+  try expect(!result.ok && result.status == "unknown", "partial audit read must not finish rollback")
+  try expect(h.backend.lookupCount == 0 && h.backend.removeCount == 0,
+    "failed audit read must stop before processing any operation")
+  try expect(h.backend.items.count == 3, "failed audit read must preserve all synthetic items")
+  try expect(try h.journal.read("operation:rollback:read-failure", as: OperationRecord.self)?.state == "unknown",
+    "failed audit read must not mark the rollback journal complete")
+  try clearAuditReadFailure(h)
+  try expect(try h.audit.operations(for: "read-failure").count == 3,
+    "failed audit read must not mark the batch rolled back")
+}
+
 private let scenarios: [(String, () throws -> Void)] = [
+  ("audit read rejects partial operations", testAuditReadNeverReturnsPartialOperations),
+  ("audit read failure stops rollback", testAuditReadFailureStopsRollbackBeforeRecovery),
   ("create found and absent", testCreateRollbackFoundAndAbsent),
   ("ambiguous and query error", testAmbiguousOrFailedLookupNeverMeansAbsent),
   ("delete reconcile", testDeleteReconcileDistinguishesErrorFromAbsent),
