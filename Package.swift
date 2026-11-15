@@ -16,14 +16,14 @@ let package = Package(
       dependencies: ["CalendarBridgeCore"],
       path: "Sources/CalendarBridge",
       exclude: ["main.swift"],
-      sources: ["AuditStore.swift", "EventKitService.swift", "RecoveryAccess.swift", "ReminderKitPrivateService.swift"],
+      sources: ["AuditStore.swift", "EventKitMapping.swift", "EventKitService.swift", "RecoveryAccess.swift", "ReminderKitPrivateService.swift"],
       linkerSettings: [.linkedLibrary("sqlite3")]
     ),
     .executableTarget(
       name: "CalendarBridge",
       dependencies: ["CalendarBridgeCore", "CalendarBridgeRuntime"],
       path: "Sources/CalendarBridge",
-      exclude: ["AuditStore.swift", "EventKitService.swift", "RecoveryAccess.swift", "ReminderKitPrivateService.swift"],
+      exclude: ["AuditStore.swift", "EventKitMapping.swift", "EventKitService.swift", "RecoveryAccess.swift", "ReminderKitPrivateService.swift"],
       sources: ["main.swift"]
     ),
     .executableTarget(name: "CalendarBridgeServiceTests", dependencies: ["CalendarBridgeCore", "CalendarBridgeRuntime"], path: "Tests/ServiceRecoveryTests"),
