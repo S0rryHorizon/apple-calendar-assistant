@@ -45,7 +45,7 @@ extension EventKitService {
       from: draft.recurrence, timezone: timezone.identifier)
   }
 
-  func alarms(from specs: [AlertSpec], timezone: String) throws -> [EKAlarm] {
+  private func alarms(from specs: [AlertSpec], timezone: String) throws -> [EKAlarm] {
     try specs.map { spec in
       if let at = spec.at {
         return EKAlarm(absoluteDate: try CalendarRules.parseDate(at, timeZoneIdentifier: timezone))
@@ -55,7 +55,7 @@ extension EventKitService {
     }
   }
 
-  func recurrenceRules(from spec: RecurrenceSpec?, timezone: String) throws
+  private func recurrenceRules(from spec: RecurrenceSpec?, timezone: String) throws
     -> [EKRecurrenceRule]?
   {
     guard let spec else { return nil }
@@ -135,7 +135,7 @@ extension EventKitService {
     return result
   }
 
-  func nativeEarlyReminder(
+  private func nativeEarlyReminder(
     for alert: AlertSpec,
     referenceDate: Date,
     timeZoneIdentifier: String
@@ -232,7 +232,7 @@ extension EventKitService {
     )
   }
 
-  func recurrenceSpec(_ rule: EKRecurrenceRule?) -> RecurrenceSpec? {
+  private func recurrenceSpec(_ rule: EKRecurrenceRule?) -> RecurrenceSpec? {
     guard let rule else { return nil }
     let frequency: String
     switch rule.frequency {
@@ -260,7 +260,7 @@ extension EventKitService {
     )
   }
 
-  func alertSpecs(_ alarms: [EKAlarm]?) -> [AlertSpec] {
+  private func alertSpecs(_ alarms: [EKAlarm]?) -> [AlertSpec] {
     (alarms ?? []).map { alarm in
       if let date = alarm.absoluteDate { return AlertSpec(at: CalendarRules.formatDate(date)) }
       return AlertSpec(minutesBefore: max(0, Int(round(-alarm.relativeOffset / 60))))

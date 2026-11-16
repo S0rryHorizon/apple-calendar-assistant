@@ -24,7 +24,6 @@ package final class EventKitService: RecoveryBackend {
   private let journal: OperationJournal
   private let audit: AuditStore
   private let injectedRecovery: (any RecoveryBackend)?
-  private let encoder = JSONEncoder()
   private let decoder = JSONDecoder()
 
   private var recovery: any RecoveryBackend { injectedRecovery ?? self }
@@ -34,14 +33,12 @@ package final class EventKitService: RecoveryBackend {
     journal = try OperationJournal(directory: AuditStore.baseDirectory.appendingPathComponent("journal-v2"))
     audit = try AuditStore()
     injectedRecovery = nil
-    encoder.outputFormatting = [.sortedKeys]
   }
 
   package init(journal: OperationJournal, audit: AuditStore, recovery: any RecoveryBackend) {
     self.journal = journal
     self.audit = audit
     injectedRecovery = recovery
-    encoder.outputFormatting = [.sortedKeys]
   }
 
   package func handle(_ request: BridgeRequest) throws -> BridgeResponse {
@@ -953,11 +950,6 @@ package final class EventKitService: RecoveryBackend {
     if fallback.kind == .reminder, fallback.earlyReminder != nil {
       var adjusted = actual
       adjusted.earlyReminder = try ReminderKitPrivateService.readEarlyReminder(reminderID: id)
-      return adjusted
-    }
-    if actual.alerts.count < fallback.alerts.count {
-      var adjusted = actual
-      adjusted.alerts = actual.alerts
       return adjusted
     }
     return actual
